@@ -6,11 +6,16 @@ import mne
 from mne.io import read_raw_kit, read_raw
 import ast
 import time
-from matplotlib import pyplot as plt
 from autoreject import AutoReject
+from mne.coreg import Coregistration, scale_mri
 
 
 config = utils.load_config()
+
+
+############################################
+# Preprocessing pipeline
+############################################
 
 def preprocess(subject, session, task, preICA, redo=False):
     print(f"{'Pre-ICA' if preICA else 'Post-ICA'}: subject {subject}, session {session}, task {task}")
@@ -146,13 +151,119 @@ def trial_postICA(subject, session, task, redo=False):
     epochs_clean.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostICA_epo.fif"), overwrite=True)
 
 
+############################################
+# Evoked
+############################################
+
+def trial_evoked(subject):
+    # Read participants information
+    participants_info = pd.read_csv(config['preprocessing']['participants_info_file'])
+    participant = participants_info.loc[participants_info['participant_id'] == 'sub-' + subject]
+    assert len(participant) == 1, f"Participant {subject} not found"
+    participant = participant.iloc[0]
+    n_sessions = participant['n_sessions']
+
+    report = mne.Report(verbose=True, title=f"Evoked report for subject {subject}")
+
+    evoked = list()
+    for session in range(n_sessions):
+        for task in range(4):
+            epochs = mne.read_epochs(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostICA_epo.fif"))
+            evoked.append(epochs.average())
+
+    evoked_grand = mne.grand_average(evoked)
+    evoked_grand.plot_joint()
+
+    report.add_evokeds(evoked, title='Evoked responses')
+    report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"sub-{subject}_evoked_report.html"), overwrite=True)
+
+    return evoked_grand
+
+
+def trial_evoked_source(subject):
+    return NotImplementedError
+
+
+############################################
+# Decoding
+############################################
+
+
+############################################
+# Source localization pipeline
+############################################
+
+def trial_coregister(subject, session):
+    subject_data_dir = os.path.join(config['directories']['source_dir'], f"sub-{subject}", f"ses-{session}", "meg")
+    derivative_dir = os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg")
+
+    if not os.path.exists(derivative_dir):
+        os.makedirs(derivative_dir)
+        print(f"Created directory {derivative_dir}")
+
+    # Create mne report
+    report = mne.Report(verbose=True, title=f"Coregistration report for subject {subject}, session {session}")
+
+    # Load raw data
+    elp = os.path.join(subject_data_dir, f"sub-{subject}_ses-{session}_acq-ELP_headshape.pos")
+    hsp = os.path.join(subject_data_dir, f"sub-{subject}_ses-{session}_acq-HSP_headshape.pos")
+    elp = utils.read_pos(elp)
+    hsp = utils.read_pos(hsp)
+    raw = read_raw_kit(os.path.join(subject_data_dir, f"sub-{subject}_ses-{session}_task-0_meg.con"),
+                       mrk = os.path.join(subject_data_dir, f"sub-{subject}_ses-{session}_task-0_markers.mrk"),
+                       elp = elp / 1000, hsp = hsp / 1000).load_data()
+    
+    # Coregistration
+    coreg = Coregistration(raw.info, 'fsaverage', subjects_dir=config['directories']['freesurfer_subjects_dir'], fiducials="estimated")
+    coreg.set_scale_mode('uniform').set_fid_match('matched')
+    coreg.fit_fiducials()
+    coreg.set_scale_mode('3-axis')
+    for _ in range(4): 
+        coreg.fit_icp(nasion_weight=1)
+    trans_path = os.path.join(derivative_dir, f"sub-{subject}_ses-{session}_trans.fif")
+    mne.write_trans(trans_path, coreg.trans, overwrite=True)
+    new_mri_name = f"MEG-MASC_sub-{subject}_ses-{session}"
+    scale_mri('fsaverage', new_mri_name, subjects_dir=config['directories']['freesurfer_subjects_dir'], scale=coreg.scale, overwrite=True, annot=True)
+
+    report.add_trans(
+        trans=trans_path,
+        info=raw.info,
+        subject=new_mri_name,
+        subjects_dir=config['directories']['freesurfer_subjects_dir'],
+        alpha=0.7,
+        title="Coregistration"
+    )
+
+    report.save(os.path.join(derivative_dir, f"sub-{subject}_ses-{session}_coreg_report.html"), overwrite=True)
+
+
+def trial_forward_inverse(subject, session, task):
+    raise NotImplementedError
+
+
+def trial_covariance(subject, session, task):
+    raise NotImplementedError
+
+############################################
+# Regression analysis pipeline
+############################################
+
+def rERPs(subject, session, task):
+    raise NotImplementedError
+
+
+def rERP_source(subject, session, task):
+    raise NotImplementedError
+ 
+
 if __name__ == '__main__':
-    # # Time execution
-    # start = time.time()
-    # trial_ICA('01', '0', '0', redo=True)
-    # end = time.time()
-    # print(f"Elapsed time: {end - start} seconds")
+    # Time execution
+    start = time.time()
 
-    # annotate_ICA('01', '0', '0')
+    # trial_ICA('01', '0', '1', redo=True)
+    # annotate_ICA('01', '0', '3')
+    # trial_postICA('01', '0', '3', redo=True)
+    trial_coregister('01', '1')
 
-    trial_postICA('01', '0', '0', redo=True)
+    end = time.time()
+    print(f"Elapsed time: {end - start} seconds")
