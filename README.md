@@ -12,13 +12,13 @@ Steps:
 
 - Manual bad channel exclusion
 
-- Resample MEG data to 200 Hz and 0.1 Hz highpass.
+- Epoch + resample MEG data to 200 Hz and 0.1 Hz highpass.
+
+    - Epoching is suggested to be done before resampling to avoid jittering, check [this tutorial](https://mne.tools/stable/auto_tutorials/preprocessing/30_filtering_resampling.html).
 
 - ICA: [1, 100] Hz pre-ICA bandpass filtering + extended INFOMAX
 
     - EOG and ECG are conservatively annotated.
-
-- Epoching: tmin = -0.2, tmax = 1.0
 
 - Auto Rejection
 
