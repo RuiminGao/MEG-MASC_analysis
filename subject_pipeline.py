@@ -172,9 +172,9 @@ def trial_evoked(subject):
             evoked.append(epochs.average())
 
     evoked_grand = mne.grand_average(evoked)
-    evoked_grand.plot_joint()
+    evoked_grand.plot_joint(times=[-0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
 
-    report.add_evokeds(evoked, title='Evoked responses')
+    report.add_evokeds(evoked_grand, title='Evoked responses')
     report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"sub-{subject}_evoked_report.html"), overwrite=True)
 
     return evoked_grand
@@ -332,12 +332,12 @@ if __name__ == '__main__':
     # Time execution
     start = time.time()
 
-    trial_ICA('01', '1', '0')
-    # annotate_ICA('01', '0', '2')
+    # trial_ICA('01', '1', '3')
+    # annotate_ICA('01', '1', '3')
     # trial_postICA('01', '0', '1')
     # trial_coregister('01', '1')
     # trial_forward('01', '0', '0')
-    # trial_inverse('01', '0', '0')
+    trial_inverse('01', '0', '1')
 
     end = time.time()
     print(f"Elapsed time: {end - start} seconds")
