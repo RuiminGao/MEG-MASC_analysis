@@ -40,6 +40,8 @@ Codes derived from Dr. Jon Brennan's codes: https://github.com/cnllab/lpp-l2-eeg
 
 ## Evoked
 
+## Decoding
+
 ## rERP Sensor
 
 ## rERP Source

@@ -55,7 +55,3 @@ def read_annotations(subject, session, task, config):
         meta.append(d)
     meta = pd.DataFrame(meta)
     return meta
-
-
-# TODO: parallel processing support
-

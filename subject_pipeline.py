@@ -148,16 +148,16 @@ def trial_postICA(subject, session, task, redo=False):
     report.add_epochs(epochs_clean, title='Epochs after AutoReject')
     report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_AR_report.html"), overwrite=True)
 
-    epochs_clean.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostICA_epo.fif"), overwrite=True)
+    epochs_clean.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostAR_epo.fif"), overwrite=True)
 
 
 ############################################
 # Evoked
 ############################################
 
-def trial_evoked(subject):
+def subject_evoked(subject):
     # Read participants information
-    participants_info = pd.read_csv(config['preprocessing']['participants_info_file'])
+    participants_info = pd.read_csv(config['preprocessing']['participants_info_file'], sep='\t' if config['preprocessing']['participants_info_file'].endswith('tsv') else ',')
     participant = participants_info.loc[participants_info['participant_id'] == 'sub-' + subject]
     assert len(participant) == 1, f"Participant {subject} not found"
     participant = participant.iloc[0]
@@ -165,28 +165,42 @@ def trial_evoked(subject):
 
     report = mne.Report(verbose=True, title=f"Evoked report for subject {subject}")
 
+    # Grand average evoked
     evoked = list()
     for session in range(n_sessions):
         for task in range(4):
-            epochs = mne.read_epochs(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostICA_epo.fif"))
+            epochs = mne.read_epochs(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostAR_epo.fif"))
             evoked.append(epochs.average())
 
     evoked_grand = mne.grand_average(evoked)
-    evoked_grand.plot_joint(times=[-0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+    # evoked_grand.plot_joint(times=[-0.1, 0.0, 0.1, 0.3, 0.5, 0.7, 0.9])
 
-    report.add_evokeds(evoked_grand, title='Evoked responses')
+    report.add_evokeds(evoked_grand)
+    
+    # Grand average evoked source  
+    stcs = []
+    for session in range(n_sessions):
+        for task in range(4):
+            inv = mne.minimum_norm.read_inverse_operator(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_inv.fif"))
+            stcs.append(mne.minimum_norm.apply_inverse(evoked[session * 4 + task], inv))
+    
+    # change this to grand average, n_epochs for a evoked is evoked.nave
+    data = np.sum([stcs[i].data * evoked[i].nave for i in range(len(evoked))], axis=0) / np.sum([evoked[i].nave for i in range(len(evoked))])
+    stc = mne.SourceEstimate(data, stcs[0].vertices, stcs[0].tmin, stcs[0].tstep, stcs[0].subject)
+
+    report.add_stc(stc, title="Grand average evoked source (inflated)", n_time_points=10)
     report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"sub-{subject}_evoked_report.html"), overwrite=True)
 
     return evoked_grand
 
 
-def trial_evoked_source(subject):
-    return NotImplementedError
-
-
 ############################################
 # Decoding
 ############################################
+
+def subject_decode(subject):
+    # Word frequency decoding
+    raise NotImplementedError
 
 
 ############################################
@@ -281,7 +295,7 @@ def trial_inverse(subject, session, task):
     report = mne.Report(verbose=True, title=f"Inverse solution report for subject {subject}, session {session}, task {task}")
 
     # Read epochs
-    epochs = mne.read_epochs(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostICA_epo.fif"))
+    epochs = mne.read_epochs(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostAR_epo.fif"))
 
     info = read_info(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_info.fif"))
     bad_channels = pd.read_csv(config['preprocessing']['bad_channels_file'])
@@ -306,6 +320,7 @@ def trial_inverse(subject, session, task):
     report.add_inverse_operator(inv, title="Inverse operator")
     report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_inv_report.html"), overwrite=True)
 
+
 ############################################
 # Regression analysis pipeline
 ############################################
@@ -325,6 +340,15 @@ def rERPs(subject, session, task):
 
 
 def rERP_source(subject, session, task):
+    rerp_predictors = ["intercept", "logfreq"]
+    # TODO: add surprisal predictors
+
+    epochs = None
+
+    # design matrix: N_epochs x N_predictors
+    design = None
+
+    rerp = mne.stats.linear_regression(epochs, design_matrix=design, names=rerp_predictors)
     raise NotImplementedError
  
 
@@ -337,7 +361,8 @@ if __name__ == '__main__':
     # trial_postICA('01', '0', '1')
     # trial_coregister('01', '1')
     # trial_forward('01', '0', '0')
-    trial_inverse('01', '0', '1')
+    # trial_inverse('01', '1', '2')   # next
+    subject_evoked('01')
 
     end = time.time()
     print(f"Elapsed time: {end - start} seconds")
