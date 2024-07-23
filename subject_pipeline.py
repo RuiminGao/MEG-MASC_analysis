@@ -285,6 +285,7 @@ def trial_forward(subject, session, task):
 
     trans = os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_trans.fif")
     fwd = mne.make_forward_solution(info, trans, src, bem, ignore_ref = True)
+    # fwd = mne.convert_forward_solution(fwd, surf_ori=True, force_fixed=True, use_cps=True)
     mne.write_forward_solution(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_fwd.fif"), fwd, overwrite=True)
 
     report.add_forward(fwd, title="Forward solution")
@@ -307,15 +308,20 @@ def trial_inverse(subject, session, task):
     epochs.info = info
 
     # Compute covariance
-    cov = mne.compute_covariance(epochs, tmax=0, method='auto')
-    mne.write_cov(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_cov.fif"), cov, overwrite=True)
-    
-    report.add_covariance(cov, info = epochs.info, title="Covariance")
+    if os.path.exists(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_cov.fif")):
+        print(f"Reading covariance for subject {subject}, session {session}, task {task}")
+        cov = mne.read_cov(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_cov.fif"))
+    else:
+        print(f"Computing covariance for subject {subject}, session {session}, task {task}")
+        cov = mne.compute_covariance(epochs, tmax=0, method='auto')
+        mne.write_cov(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_cov.fif"), cov, overwrite=True)
+        
+        report.add_covariance(cov, info = epochs.info, title="Covariance")
 
     # Read forward solution
     fwd = mne.read_forward_solution(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_fwd.fif"))
-    inv = mne.minimum_norm.make_inverse_operator(info, fwd, cov, loose=1.)
-    mne.minimum_norm.write_inverse_operator(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_inv.fif"), inv)
+    inv = mne.minimum_norm.make_inverse_operator(info, fwd, cov, loose=1.0)
+    mne.minimum_norm.write_inverse_operator(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_inv.fif"), inv, overwrite=True)
     
     report.add_inverse_operator(inv, title="Inverse operator")
     report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_inv_report.html"), overwrite=True)
@@ -334,35 +340,68 @@ def get_surprisal_predictors():
 
     raise NotImplementedError
 
-def rERPs(subject, session, task):
+# TODO: all below, POC without surprisal table first.
+def rERF_sensor(subject):
+    report = mne.Report(verbose=True, title=f"rERF sensor report for subject {subject}")
     # TODO: need to check epochs number & metadata alignment first
+
+    # Load epochs
+
+    # Add baseline predictors
+
+    # Add surprisal predictors
+
+    # Design matrix: N_epochs x N_predictors
+
+    # rERF
+
+    # Plot and save rERF
+    
     raise NotImplementedError
 
 
-def rERP_source(subject, session, task):
-    rerp_predictors = ["intercept", "logfreq"]
-    # TODO: add surprisal predictors
+def rERF_source(subject):
+    report = mne.Report(verbose=True, title=f"rERF source report for subject {subject}")
 
-    epochs = None
+    # TODO: Read epochs and conduct source localization (apply_inverse_epochs)
+    stcs = []
 
-    # design matrix: N_epochs x N_predictors
+    # TODO: Add baseline predictors
+    rerf_predictors = ["intercept", "logfreq"]
+
+    # TODO: Add surprisal predictors
+
+    # TODO: Design matrix: N_epochs x N_predictors
     design = None
 
-    rerp = mne.stats.linear_regression(epochs, design_matrix=design, names=rerp_predictors)
-    raise NotImplementedError
- 
+    # rERF
+    rerf = mne.stats.linear_regression(stcs, design_matrix=design, names=rerf_predictors)
+
+    # Plot and save rERF
+    for pred in rerf_predictors:
+        report.add_stc(rerf[pred].beta, title=f"rERF source beta for {pred}")
+        report.add_stc(rerf[pred].p_val, title=f"rERF source p-value for {pred}")
+        rerf[pred].beta.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"sub-{subject}_desc-{pred}-rerf-stc-beta"), overwrite=True)
+        rerf[pred].p_val.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"sub-{subject}_desc-{pred}-rerf-stc-pval"), overwrite=True)
+
+    report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"sub-{subject}_rerf_report.html"), overwrite=True)
+
 
 if __name__ == '__main__':
     # Time execution
     start = time.time()
 
     # trial_ICA('01', '1', '3')
-    # annotate_ICA('01', '1', '3')
+    # annotate_ICA('01', '1', '3')      #### Manual Step
     # trial_postICA('01', '0', '1')
     # trial_coregister('01', '1')
-    # trial_forward('01', '0', '0')
-    # trial_inverse('01', '1', '2')   # next
-    subject_evoked('01')
+
+    # for session in range(2):
+    #     for task in range(4):
+    #         trial_forward('01', str(session), str(task))
+    #         trial_inverse('01', str(session), str(task))
+
+    # subject_evoked('01')
 
     end = time.time()
     print(f"Elapsed time: {end - start} seconds")
