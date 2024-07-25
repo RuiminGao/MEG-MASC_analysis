@@ -1,1 +1,4 @@
 __pycache__/
+stimuli/
+.DS_Store
+config.ini

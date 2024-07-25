@@ -6,8 +6,12 @@ import mne
 from mne.io import read_raw_kit, read_raw, write_info, read_info
 import ast
 import time
-from autoreject import AutoReject
+from autoreject import AutoReject, get_rejection_threshold
 from mne.coreg import Coregistration, scale_mri
+from wordfreq import zipf_frequency
+import itertools
+import argparse
+from tqdm import tqdm
 
 
 config = utils.load_config()
@@ -17,20 +21,9 @@ config = utils.load_config()
 # Preprocessing pipeline
 ############################################
 
-def preprocess(subject, session, task, preICA, redo=False):
-    print(f"{'Pre-ICA' if preICA else 'Post-ICA'}: subject {subject}, session {session}, task {task}")
-
+def trial_get_raw(subject, session, task):
     subject_data_dir = os.path.join(config['directories']['source_dir'], f"sub-{subject}", f"ses-{session}", "meg")
-    derivative_dir = os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg")
-
-    if not redo and os.path.exists(os.path.join(derivative_dir, f"sub-{subject}_ses-{session}_task-{task}_desc-{'PreICA' if preICA else 'PostICA'}_meg.fif")):
-        print(f"{'Pre-ICA' if preICA else 'Post-ICA'} file for subject {subject}, session {session}, task {task} already exists")
-        return read_raw(os.path.join(derivative_dir, f"sub-{subject}_ses-{session}_task-{task}_desc-{'PreICA' if preICA else 'PostICA'}_meg.fif")).load_data()
-
-    # Create mne report
-    report = mne.Report(verbose=True, title=f"Processing report for subject {subject}, session {session}, task {task}")
-
-    # Load raw data
+    
     elp = os.path.join(subject_data_dir, f"sub-{subject}_ses-{session}_acq-ELP_headshape.pos")
     hsp = os.path.join(subject_data_dir, f"sub-{subject}_ses-{session}_acq-HSP_headshape.pos")
     elp = utils.read_pos(elp)
@@ -46,8 +39,10 @@ def preprocess(subject, session, task, preICA, redo=False):
     assert len(bad_channels) == 1, f"Bad channels information for subject {subject}, session {session}, task {task} not found"
     bad_channels = bad_channels.iloc[0]
     raw.info['bads'] = ast.literal_eval(bad_channels['bad_channels'])
-    report.add_raw(raw, title='Raw data')
 
+    return raw
+
+def get_epochs(subject, session, task, raw, preICA):
     current_sfreq = raw.info["sfreq"]
     desired_sfreq = config.getfloat('preprocessing', 'resample')
     decim = np.round(current_sfreq / desired_sfreq).astype(int)
@@ -55,159 +50,127 @@ def preprocess(subject, session, task, preICA, redo=False):
     resample_lowpass_freq = obtained_sfreq / 3.0
     raw.filter(config.getfloat('preprocessing', 'highpass') if not preICA else config.getfloat('ica', 'pre_ica_highpass'), 
                resample_lowpass_freq if not preICA else config.getfloat('ica', 'pre_ica_lowpass'))
-
-    report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-{'PreICA' if preICA else 'PostICA'}_report.html"), overwrite=redo)
-
-    prec_path = os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-{'PreICA' if preICA else 'PostICA'}_meg.fif")
-    raw.save(prec_path, overwrite=redo)
     
-    return raw
+    # Epoching
+    meta = utils.read_annotations(subject, session, task, config)
+    meta = meta.query('kind=="word"')
+    events = np.c_[meta.onset * raw.info["sfreq"], np.ones((len(meta), 2))].astype(int)
+    epochs = mne.Epochs(raw, events, decim=decim, event_repeated='drop',
+                        tmin=config.getfloat('preprocessing', 'tmin'), tmax=config.getfloat('preprocessing', 'tmax'),
+                        baseline = None if preICA else (None, 0))
+    epochs.resample(desired_sfreq)  # Filtering, epoching, and resampling follows the best practice suggested in https://mne.tools/stable/auto_tutorials/preprocessing/30_filtering_resampling.html
+    return epochs
+    
+
+def preprocess(subject, session, task, preICA):
+    print(f"{'Pre-ICA' if preICA else 'Post-ICA'}: subject {subject}, session {session}, task {task}")
+
+    # Create mne report
+    report = mne.Report(title=f"Processing report for subject {subject}, session {session}, task {task}")
+
+    # Load raw data
+    raw = trial_get_raw(subject, session, task)
+    report.add_raw(raw, title='Raw data')
+
+    if not preICA:
+        ica_file = os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_ica.fif")
+        ica = mne.preprocessing.read_ica(ica_file)
+
+        ica.apply(raw)
+        report.add_raw(raw, title='Post-ICA raw data')
+
+    epochs = get_epochs(subject, session, task, raw, preICA)
+    report.add_epochs(epochs, title='Resampled epochs')
+    
+    # AutoReject: global thresholding
+    if preICA:
+        threshold = get_rejection_threshold(epochs, random_state=config.getint('autoreject', 'random_state'))
+        epochs = epochs.drop_bad(reject=threshold)
+        report.add_epochs(epochs, title='Epochs after AutoReject')
+
+    else:
+        ar = AutoReject(n_jobs=8, random_state=config.getint('autoreject', 'random_state'))
+        epochs = ar.fit_transform(epochs)
+        report.add_epochs(epochs, title='Epochs after AutoReject')
+
+        prec_path = os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostAR_epo.fif")
+        epochs.save(prec_path, overwrite=True)
+
+    report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-{'PreICA' if preICA else 'PostICA'}_report.html"), overwrite=True, open_browser=False)
+    
+    return epochs
 
     
 def trial_ICA(subject, session, task, redo=False):
     trial_dir = os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg")
     ica_file = os.path.join(trial_dir, f"sub-{subject}_ses-{session}_task-{task}_ica.fif")
 
-    if not redo:
-        assert not os.path.exists(ica_file), f"ICA file {ica_file} already exists"
+    if not redo and os.path.exists(ica_file):
+        print(f"ICA file {ica_file} already exists")
+        return
 
     if not os.path.exists(trial_dir):
         os.makedirs(trial_dir)
         print(f"Created directory {trial_dir}")
 
-    preprocessed = preprocess(subject, session, task, preICA=True)
+    epochs = preprocess(subject, session, task, preICA=True)
 
     ica = mne.preprocessing.ICA(
-        n_components = config.getfloat('ica', 'n_components'),
+        n_components = config.getint('ica', 'n_components'),
         method = config['ica']['method'],
         verbose = True,
         fit_params=dict(extended=True),
         random_state = config.getint('ica', 'random_state')
     )
-    ica.fit(preprocessed)
+    ica.fit(epochs)
     ica.save(ica_file, overwrite=redo)
 
 
-def annotate_ICA(subject, session, task):
-    preprocessed = preprocess(subject, session, task, preICA=False)
+def annotate_ICA(subject, session, task, redo=False):
+    if not redo and os.path.exists(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostAR_epo.fif")):
+        print(f"Post-AR epochs for subject {subject}, session {session}, task {task} already exist")
+        return
 
-    report = mne.Report(verbose=True, title=f"ICA report for subject {subject}, session {session}, task {task}")
+    raw = trial_get_raw(subject, session, task)
 
     # Load ICA file
     ica_file = os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_ica.fif")
     ica = mne.preprocessing.read_ica(ica_file)
 
     mne.set_config('MNE_BROWSER_BACKEND', 'qt')
-    ica.plot_sources(inst=preprocessed, show=True, start=0, stop=10, title="ICA sources", show_scrollbars=True, block=False)
+    ica.plot_sources(inst=raw, show=True, start=0, stop=10, title="ICA sources", show_scrollbars=True, block=False)
     ica.plot_components(show=True, title="ICA components")
 
     print(ica.exclude)
-
-    report.add_ica(
-        ica=ica,
-        title="ICA cleaning",
-        inst=preprocessed,
-        n_jobs=8
-    )
-
-    report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_ica_report.html"), overwrite=True)
 
     # Save excluded ICA
     ica_file = os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_ica.fif")
     ica.save(ica_file, overwrite=True)
 
 
-def trial_postICA(subject, session, task, redo=False):
-    preprocessed = preprocess(subject, session, task, preICA=False)
-    report = mne.Report(verbose=True, title=f"Post-ICA report for subject {subject}, session {session}, task {task}")
-
-    # Load ICA file
-    ica_file = os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_ica.fif")
-    ica = mne.preprocessing.read_ica(ica_file)
-
-    report.add_raw(preprocessed, title='Raw data')
-
-    ica.apply(preprocessed)
-
-    report.add_raw(preprocessed, title='Post-ICA raw data')
-
-    meta = utils.read_annotations(subject, session, task, config)
-    meta = meta.query('kind=="word"')
-    events = np.c_[meta.onset * preprocessed.info["sfreq"], np.ones((len(meta), 2))].astype(int)
-    current_sfreq = preprocessed.info["sfreq"]
-    desired_sfreq = config.getfloat('preprocessing', 'resample')
-    decim = np.round(current_sfreq / desired_sfreq).astype(int)
-    epochs = mne.Epochs(preprocessed, events, decim=decim, event_repeated='drop',
-                        tmin=config.getfloat('preprocessing', 'tmin'), tmax=config.getfloat('preprocessing', 'tmax'))
-    epochs.resample(desired_sfreq)  # Filtering, epoching, and resampling follows the best practice suggested in https://mne.tools/stable/auto_tutorials/preprocessing/30_filtering_resampling.html
-    report.add_epochs(epochs, title='Epochs after ICA')
-
-    ar = AutoReject(n_jobs=8, random_state=config.getint('autoreject', 'random_state'))
-    epochs_clean = ar.fit_transform(epochs)
-
-    report.add_epochs(epochs_clean, title='Epochs after AutoReject')
-    report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_AR_report.html"), overwrite=True)
-
-    epochs_clean.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostAR_epo.fif"), overwrite=True)
-
-
 ############################################
 # Evoked
 ############################################
 
-def subject_evoked(subject):
-    # Read participants information
-    participants_info = pd.read_csv(config['preprocessing']['participants_info_file'], sep='\t' if config['preprocessing']['participants_info_file'].endswith('tsv') else ',')
-    participant = participants_info.loc[participants_info['participant_id'] == 'sub-' + subject]
-    assert len(participant) == 1, f"Participant {subject} not found"
-    participant = participant.iloc[0]
-    n_sessions = participant['n_sessions']
+def trial_evoked(subject, session, task):
+    report = mne.Report(title=f"Evoked report for subject {subject} session {session} task {task}")
 
-    report = mne.Report(verbose=True, title=f"Evoked report for subject {subject}")
-
-    # Grand average evoked
-    evoked = list()
-    for session in range(n_sessions):
-        for task in range(4):
-            epochs = mne.read_epochs(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostAR_epo.fif"))
-            evoked.append(epochs.average())
-
-    evoked_grand = mne.grand_average(evoked)
-    # evoked_grand.plot_joint(times=[-0.1, 0.0, 0.1, 0.3, 0.5, 0.7, 0.9])
-
-    report.add_evokeds(evoked_grand)
+    epochs = mne.read_epochs(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostAR_epo.fif"))
+    evoked = epochs.average()
+    report.add_evokeds(evoked)
     
-    # Grand average evoked source  
-    stcs = []
-    for session in range(n_sessions):
-        for task in range(4):
-            inv = mne.minimum_norm.read_inverse_operator(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_inv.fif"))
-            stcs.append(mne.minimum_norm.apply_inverse(evoked[session * 4 + task], inv))
-    
-    # change this to grand average, n_epochs for a evoked is evoked.nave
-    data = np.sum([stcs[i].data * evoked[i].nave for i in range(len(evoked))], axis=0) / np.sum([evoked[i].nave for i in range(len(evoked))])
-    stc = mne.SourceEstimate(data, stcs[0].vertices, stcs[0].tmin, stcs[0].tstep, stcs[0].subject)
+    inv = mne.minimum_norm.read_inverse_operator(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_inv.fif"))
+    stc = mne.minimum_norm.apply_inverse(evoked, inv)
+    report.add_stc(stc, title="Evoked source")
 
-    report.add_stc(stc, title="Grand average evoked source (inflated)", n_time_points=10)
-    report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"sub-{subject}_evoked_report.html"), overwrite=True)
-
-    return evoked_grand
-
-
-############################################
-# Decoding
-############################################
-
-def subject_decode(subject):
-    # Word frequency decoding
-    raise NotImplementedError
+    report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_evoked_report.html"), overwrite=True, open_browser=False)
 
 
 ############################################
 # Source localization pipeline
 ############################################
 
-def trial_coregister(subject, session):
+def trial_coregister(subject, session, task):
     subject_data_dir = os.path.join(config['directories']['source_dir'], f"sub-{subject}", f"ses-{session}", "meg")
     derivative_dir = os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg")
 
@@ -216,23 +179,23 @@ def trial_coregister(subject, session):
         print(f"Created directory {derivative_dir}")
 
     # Create mne report
-    report = mne.Report(verbose=True, title=f"Coregistration report for subject {subject}, session {session}")
+    report = mne.Report(title=f"Coregistration report for subject {subject}, session {session}, task {task}")
 
-    info_path = os.path.join(derivative_dir, f"sub-{subject}_ses-{session}_info.fif")
+    info_path = os.path.join(derivative_dir, f"sub-{subject}_ses-{session}_task-{task}_info.fif")
     if not os.path.exists(info_path):
-        print(f"Creating info file for subject {subject}, session {session}")
+        print(f"Creating info file for subject {subject}, session {session}, task {task}")
         # Load raw data
         elp = os.path.join(subject_data_dir, f"sub-{subject}_ses-{session}_acq-ELP_headshape.pos")
         hsp = os.path.join(subject_data_dir, f"sub-{subject}_ses-{session}_acq-HSP_headshape.pos")
         elp = utils.read_pos(elp)
         hsp = utils.read_pos(hsp)
-        raw = read_raw_kit(os.path.join(subject_data_dir, f"sub-{subject}_ses-{session}_task-0_meg.con"),
-                        mrk = os.path.join(subject_data_dir, f"sub-{subject}_ses-{session}_task-0_markers.mrk"),
+        raw = read_raw_kit(os.path.join(subject_data_dir, f"sub-{subject}_ses-{session}_task-{task}_meg.con"),
+                        mrk = os.path.join(subject_data_dir, f"sub-{subject}_ses-{session}_task-{task}_markers.mrk"),
                         elp = elp / 1000, hsp = hsp / 1000).load_data()
         info = raw.info
         write_info(info_path, info)
     else:
-        print(f"Loading info file for subject {subject}, session {session}")
+        print(f"Loading info file for subject {subject}, session {session} task {task}")
         info = mne.io.read_info(info_path)
     
     # Coregistration
@@ -242,9 +205,9 @@ def trial_coregister(subject, session):
     coreg.set_scale_mode('3-axis')
     for _ in range(4): 
         coreg.fit_icp(nasion_weight=1)
-    trans_path = os.path.join(derivative_dir, f"sub-{subject}_ses-{session}_trans.fif")
+    trans_path = os.path.join(derivative_dir, f"sub-{subject}_ses-{session}_task-{task}_trans.fif")
     mne.write_trans(trans_path, coreg.trans, overwrite=True)
-    new_mri_name = f"MEG-MASC_sub-{subject}_ses-{session}"
+    new_mri_name = f"MEG-MASC_sub-{subject}_ses-{session}_task-{task}"
     scale_mri('fsaverage', new_mri_name, subjects_dir=config['directories']['freesurfer_subjects_dir'], scale=coreg.scale, overwrite=True, annot=True)
 
     report.add_trans(
@@ -257,48 +220,48 @@ def trial_coregister(subject, session):
     )
 
     # Source space
-    src = mne.setup_source_space(f"MEG-MASC_sub-{subject}_ses-{session}", spacing="oct6", add_dist="patch", subjects_dir=config['directories']['freesurfer_subjects_dir'])
-    mne.write_source_spaces(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_src.fif"), src, overwrite=True)
+    src = mne.setup_source_space(f"MEG-MASC_sub-{subject}_ses-{session}_task-{task}", spacing="oct6", add_dist="patch", subjects_dir=config['directories']['freesurfer_subjects_dir'])
+    mne.write_source_spaces(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}-task-{task}_src.fif"), src, overwrite=True)
     # BEM
-    bem_model = mne.make_bem_model(subject=f"MEG-MASC_sub-{subject}_ses-{session}", 
+    bem_model = mne.make_bem_model(subject=f"MEG-MASC_sub-{subject}_ses-{session}_task-{task}", 
                                    ico=4, conductivity=(0.3,), subjects_dir=config['directories']['freesurfer_subjects_dir'])
     bem = mne.make_bem_solution(bem_model)
-    mne.write_bem_solution(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_bem.fif"), bem, overwrite=True)
+    mne.write_bem_solution(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_bem.fif"), bem, overwrite=True)
 
-    report.add_bem(subject=f"MEG-MASC_sub-{subject}_ses-{session}", subjects_dir=config['directories']['freesurfer_subjects_dir'], title="BEM")
+    report.add_bem(subject=f"MEG-MASC_sub-{subject}_ses-{session}_task-{task}", subjects_dir=config['directories']['freesurfer_subjects_dir'], title="BEM")
 
-    report.save(os.path.join(derivative_dir, f"sub-{subject}_ses-{session}_coreg_report.html"), overwrite=True)
+    report.save(os.path.join(derivative_dir, f"sub-{subject}_ses-{session}_task-{task}_coreg_report.html"), overwrite=True, open_browser=False)
 
 
 def trial_forward(subject, session, task):
-    report = mne.Report(verbose=True, title=f"Forward solution report for subject {subject}, session {session}, task {task}")
+    report = mne.Report(title=f"Forward solution report for subject {subject}, session {session}, task {task}")
 
-    info = read_info(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_info.fif"))
+    info = read_info(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_info.fif"))
     bad_channels = pd.read_csv(config['preprocessing']['bad_channels_file'])
     bad_channels = bad_channels.loc[(bad_channels['SubjectID'] == 'sub-' + subject) & (bad_channels['session'] == int(session)) & (bad_channels['task'] == int(task))]
     assert len(bad_channels) == 1, f"Bad channels information for subject {subject}, session {session}, task {task} not found"
     bad_channels = bad_channels.iloc[0]
     info['bads'] = ast.literal_eval(bad_channels['bad_channels'])
 
-    src = mne.read_source_spaces(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_src.fif"))
-    bem = mne.read_bem_solution(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_bem.fif"))
+    src = mne.read_source_spaces(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}-task-{task}_src.fif"))
+    bem = mne.read_bem_solution(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_bem.fif"))
 
-    trans = os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_trans.fif")
+    trans = os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_trans.fif")
     fwd = mne.make_forward_solution(info, trans, src, bem, ignore_ref = True)
     # fwd = mne.convert_forward_solution(fwd, surf_ori=True, force_fixed=True, use_cps=True)
     mne.write_forward_solution(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_fwd.fif"), fwd, overwrite=True)
 
     report.add_forward(fwd, title="Forward solution")
-    report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_fwd_report.html"), overwrite=True)
+    report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_fwd_report.html"), overwrite=True, open_browser=False)
 
 
 def trial_inverse(subject, session, task):
-    report = mne.Report(verbose=True, title=f"Inverse solution report for subject {subject}, session {session}, task {task}")
+    report = mne.Report(title=f"Inverse solution report for subject {subject}, session {session}, task {task}")
 
     # Read epochs
     epochs = mne.read_epochs(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostAR_epo.fif"))
 
-    info = read_info(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_info.fif"))
+    info = read_info(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_info.fif"))
     bad_channels = pd.read_csv(config['preprocessing']['bad_channels_file'])
     bad_channels = bad_channels.loc[(bad_channels['SubjectID'] == 'sub-' + subject) & (bad_channels['session'] == int(session)) & (bad_channels['task'] == int(task))]
     assert len(bad_channels) == 1, f"Bad channels information for subject {subject}, session {session}, task {task} not found"
@@ -324,84 +287,161 @@ def trial_inverse(subject, session, task):
     mne.minimum_norm.write_inverse_operator(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_inv.fif"), inv, overwrite=True)
     
     report.add_inverse_operator(inv, title="Inverse operator")
-    report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_inv_report.html"), overwrite=True)
+    report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_inv_report.html"), overwrite=True, open_browser=False)
 
 
 ############################################
 # Regression analysis pipeline
 ############################################
 
-def get_surprisal_predictors():
-    # Load epoch time information
+def get_surprisal_predictors(story_name, time_table, surprisal_time_windows):
+    surprisal_predictor = np.zeros((len(time_table), len(surprisal_time_windows)))
 
     # Load surprisal data
+    surp, word2tok = utils.load_surp(story_name, config)
+
+    meta_word_start = np.zeros(len(time_table), dtype=int)
+    meta_word_end = np.zeros(len(time_table), dtype=int)
+    meta_i = 0
+
+    for i, word in enumerate(word2tok['word']):
+        clean_word_i = utils.clean_text(word)
+        clean_meta_i = utils.clean_text(time_table['word'][meta_i])
+        j = i + 1
+        while len(clean_word_i) < len(clean_meta_i):
+            clean_word_i = clean_word_i + utils.clean_text(word2tok['word'][j])
+            j += 1
+        if clean_word_i == clean_meta_i:
+            meta_word_start[meta_i] = i
+            meta_word_end[meta_i] = j
+            meta_i += 1
+            if meta_i == len(time_table):
+                break
 
     # Calculate surprisal with time-based window
+    for i, time in enumerate(time_table.iterrows()):
+        for j, window in enumerate(surprisal_time_windows):
+            window_end = time_table['onset'][i] + time_table['duration'][i]
+            window_start = window_end - window
+            # locate the last word with onset < window_start
+            start_idx = np.where(time_table['onset'] < window_start)[0][-1] if np.where(time_table['onset'] < window_start)[0].size > 0 else -1
+            if start_idx != -1:
+                start_idx = word2tok['end'][meta_word_end[start_idx]]
+            ntok = word2tok['start'][meta_word_start[i]] - start_idx
+            if ntok <= 0: surprisal_predictor[i, j] = np.nan
+            else:
+                if ntok > 1024: ntok = 1024
+                while np.any(np.isnan(surp[f"surp_{ntok}"][meta_word_start[i]:meta_word_end[i]])):
+                    ntok -= 1
+                    if ntok == 0:
+                        raise ValueError(f"Surprisal data for word {time_table['word'][i]} is missing")
+                surprisal_predictor[i, j] = surp[f"surp_{ntok}"][meta_word_start[i]:meta_word_end[i]].sum()
 
-    raise NotImplementedError
+    return surprisal_predictor
 
-# TODO: all below, POC without surprisal table first.
-def rERF_sensor(subject):
-    report = mne.Report(verbose=True, title=f"rERF sensor report for subject {subject}")
-    # TODO: need to check epochs number & metadata alignment first
 
-    # Load epochs
-
-    # Add baseline predictors
-
-    # Add surprisal predictors
-
-    # Design matrix: N_epochs x N_predictors
-
-    # rERF
-
-    # Plot and save rERF
+def trial_rERF_source(subject, session, task, surp_win = [1, 300]):
+    # subject to change: trial evoked regression -> source localization 
+    report = mne.Report(title=f"rERF source report for subject {subject}")
     
-    raise NotImplementedError
+    rerf_predictors = ["intercept", "zipf_frequency"]
+    for win in surp_win:
+        rerf_predictors.append(f"surprisal_{win}s")
+    design = np.ones((0, len(rerf_predictors)))
 
+    epochs = mne.read_epochs(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostAR_epo.fif"))
+    meta = utils.read_annotations(subject, str(session), str(task), config)
+    meta = meta.query('kind=="word"')
+    closest_sample = []
+    for event in epochs.events[:, 0]:
+        closest_idx = np.argmin(np.abs(meta['sample'] - event))
+        closest_sample.append(meta['sample'].iloc[closest_idx])
+    meta = meta.loc[meta['sample'].isin(closest_sample)]
+    meta = meta.reset_index(drop=True)
 
-def rERF_source(subject):
-    report = mne.Report(verbose=True, title=f"rERF source report for subject {subject}")
+    intercept = np.ones((len(meta), 1))
+    zipf_freq = np.array([zipf_frequency(word, 'en') for word in meta['word']])
+    surps_design = get_surprisal_predictors(meta['story'][0], meta, surp_win)
+    valid_epo_idx = np.where(~np.isnan(surps_design).any(axis=1))[0]
 
-    # TODO: Read epochs and conduct source localization (apply_inverse_epochs)
-    stcs = []
+    print("Valid: {} out of {}, {:.2f}%".format(len(valid_epo_idx), len(surps_design), len(valid_epo_idx) / len(surps_design) * 100))
+          
+    intercept = intercept[valid_epo_idx]
+    zipf_freq = zipf_freq[valid_epo_idx]
+    surps_design = surps_design[valid_epo_idx]
+    epochs = epochs[valid_epo_idx]
 
-    # TODO: Add baseline predictors
-    rerf_predictors = ["intercept", "logfreq"]
+    design = np.vstack((design, np.c_[intercept, zipf_freq, surps_design]))
+    # picks only good chanels
+    epochs.pick_types(meg=True, eeg=False, eog=False, ecg=False, stim=False, exclude='bads')
+    rerf = mne.stats.linear_regression(epochs, design_matrix=design, names=rerf_predictors)
 
-    # TODO: Add surprisal predictors
-
-    # TODO: Design matrix: N_epochs x N_predictors
-    design = None
-
-    # rERF
-    rerf = mne.stats.linear_regression(stcs, design_matrix=design, names=rerf_predictors)
-
+    inv = mne.minimum_norm.read_inverse_operator(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_inv.fif"))
     # Plot and save rERF
     for pred in rerf_predictors:
-        report.add_stc(rerf[pred].beta, title=f"rERF source beta for {pred}")
-        report.add_stc(rerf[pred].p_val, title=f"rERF source p-value for {pred}")
-        rerf[pred].beta.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"sub-{subject}_desc-{pred}-rerf-stc-beta"), overwrite=True)
-        rerf[pred].p_val.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"sub-{subject}_desc-{pred}-rerf-stc-pval"), overwrite=True)
+        stc = mne.minimum_norm.apply_inverse(rerf[pred].beta, inv)
+        report.add_stc(stc, title=f"rERF source beta for {pred}")
 
-    report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"sub-{subject}_rerf_report.html"), overwrite=True)
+    report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_rerf_report.html"), overwrite=True, open_browser=False)
 
 
 if __name__ == '__main__':
+    # Parse argument
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--print', action='store_true', help='Print processing info')
+    parser.add_argument('--preICA', action='store_true', help='Run pre-ICA pipeline')
+    parser.add_argument('--annotateICA', action='store_true', help='Annotate ICA components')
+    parser.add_argument('--postICA', action='store_true', help='Run post-ICA pipeline')
+    parser.add_argument('--calcInv', action='store_true', help='Run inverse solution pipeline')
+    parser.add_argument('--calcEvoked', action='store_true', help='Run evoked pipeline')
+    parser.add_argument('--calcRegression', action='store_true', help='Run regression analysis pipeline')
+    parser.add_argument('--exclude_subjects', nargs='+', help='List of subjects to exclude')
+    parser.add_argument('--include_subjects', nargs='+', help='List of subjects to include')
+    parser.add_argument('--redo', action='store_true', help='Redo processing')
+    args = parser.parse_args()
+
+    participants_info = pd.read_csv(config['preprocessing']['participants_info_file'], sep='\t' if config['preprocessing']['participants_info_file'].endswith('tsv') else ',')
+
+    if args.include_subjects is None:
+        args.include_subjects = []
+    if args.exclude_subjects is not None:
+        args.include_subjects = [subject.split('-')[1] for subject in participants_info['participant_id'] if subject.split('-')[1] not in args.exclude_subjects]
+
+    if args.print:
+        utils.print_processing_info(config)
+        exit()
+
     # Time execution
     start = time.time()
 
-    # trial_ICA('01', '1', '3')
-    # annotate_ICA('01', '1', '3')      #### Manual Step
-    # trial_postICA('01', '0', '1')
-    # trial_coregister('01', '1')
+    participants_info = participants_info.loc[participants_info['participant_id'].apply(lambda x: x.split('-')[1] in args.include_subjects)]
+    
+    for subject in tqdm(participants_info['participant_id']):
+        subject = subject.split('-')[1]
+        n_sessions = participants_info.loc[participants_info['participant_id'] == 'sub-' + subject, 'n_sessions'].iloc[0]
+        for session in range(n_sessions):
 
-    # for session in range(2):
-    #     for task in range(4):
-    #         trial_forward('01', str(session), str(task))
-    #         trial_inverse('01', str(session), str(task))
+            for task in range(4):
+                if args.preICA: trial_ICA(subject, str(session), str(task), redo=args.redo)
+                if args.annotateICA: annotate_ICA(subject, str(session), str(task), redo=args.redo)
+                if args.postICA: 
+                    if not args.redo and os.path.exists(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostAR_epo.fif")):
+                        print(f"Post-AR epochs for subject {subject}, session {session}, task {task} already exist")
+                    else:
+                        preprocess(subject, str(session), str(task), preICA=False)
+                if args.calcInv: 
+                    if not args.redo and os.path.exists(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_inv.fif")):
+                        print(f"Inverse solution for subject {subject}, session {session}, task {task} already exists")
+                    else:
+                        trial_coregister(subject, str(session), str(task))
+                        trial_forward(subject, str(session), str(task))
+                        trial_inverse(subject, str(session), str(task))
+                if args.calcEvoked:
+                    trial_evoked(subject, str(session), str(task))
 
-    # subject_evoked('01')
+                if args.calcRegression:
+                    trial_rERF_source(subject, str(session), str(task))
+                
 
     end = time.time()
     print(f"Elapsed time: {end - start} seconds")
