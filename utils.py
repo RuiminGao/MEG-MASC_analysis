@@ -42,6 +42,7 @@ def read_pos(filename):
 
 
 def read_annotations(subject, session, task, config):
+    # to time
     annotation_path = BIDSPath(subject=subject, session=session, task=task, datatype='meg', root=config['directories']['source_dir'], suffix='events', extension='.tsv').match()
     annotations = pd.read_csv(annotation_path[0], sep='\t').to_dict('records')
     meta = list()

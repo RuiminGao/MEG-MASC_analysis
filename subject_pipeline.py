@@ -58,7 +58,6 @@ def get_epochs(subject, session, task, raw, preICA):
     epochs = mne.Epochs(raw, events, decim=decim, event_repeated='drop',
                         tmin=config.getfloat('preprocessing', 'tmin'), tmax=config.getfloat('preprocessing', 'tmax'),
                         baseline = None if preICA else (None, 0))
-    epochs.resample(desired_sfreq)  # Filtering, epoching, and resampling follows the best practice suggested in https://mne.tools/stable/auto_tutorials/preprocessing/30_filtering_resampling.html
     return epochs
     
 
@@ -92,6 +91,9 @@ def preprocess(subject, session, task, preICA):
         ar = AutoReject(n_jobs=8, random_state=config.getint('autoreject', 'random_state'))
         epochs = ar.fit_transform(epochs)
         report.add_epochs(epochs, title='Epochs after AutoReject')
+
+        bad_epochs = ar.get_reject_log(epochs).bad_epochs
+        bad_epochs.savetxt(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_bad_epochs.txt"))
 
         prec_path = os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostAR_epo.fif")
         epochs.save(prec_path, overwrite=True)
@@ -352,12 +354,9 @@ def trial_rERF_source(subject, session, task, surp_win = [1, 300]):
     epochs = mne.read_epochs(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostAR_epo.fif"))
     meta = utils.read_annotations(subject, str(session), str(task), config)
     meta = meta.query('kind=="word"')
-    closest_sample = []
-    for event in epochs.events[:, 0]:
-        closest_idx = np.argmin(np.abs(meta['sample'] - event))
-        closest_sample.append(meta['sample'].iloc[closest_idx])
-    meta = meta.loc[meta['sample'].isin(closest_sample)]
-    meta = meta.reset_index(drop=True)
+    # read bad epochs and remove them
+    bad_epochs = np.loadtxt(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_bad_epochs.txt"))
+    meta = meta.drop(bad_epochs.astype(int))
 
     intercept = np.ones((len(meta), 1))
     zipf_freq = np.array([zipf_frequency(word, 'en') for word in meta['word']])
@@ -385,6 +384,7 @@ def trial_rERF_source(subject, session, task, surp_win = [1, 300]):
     report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_rerf_report.html"), overwrite=True, open_browser=False)
 
 
+
 if __name__ == '__main__':
     # Parse argument
     parser = argparse.ArgumentParser()
@@ -397,15 +397,25 @@ if __name__ == '__main__':
     parser.add_argument('--calcRegression', action='store_true', help='Run regression analysis pipeline')
     parser.add_argument('--exclude_subjects', nargs='+', help='List of subjects to exclude')
     parser.add_argument('--include_subjects', nargs='+', help='List of subjects to include')
+    parser.add_argument('--exclude_tasks', nargs='+', help='List of tasks to exclude')
+    parser.add_argument('--include_tasks', nargs='+', help='List of tasks to include')
     parser.add_argument('--redo', action='store_true', help='Redo processing')
     args = parser.parse_args()
 
     participants_info = pd.read_csv(config['preprocessing']['participants_info_file'], sep='\t' if config['preprocessing']['participants_info_file'].endswith('tsv') else ',')
 
-    if args.include_subjects is None:
-        args.include_subjects = []
-    if args.exclude_subjects is not None:
+    if args.include_subjects is None and args.exclude_subjects is None:
+        args.include_subjects = [subject.split('-')[1] for subject in participants_info['participant_id']]
+    elif args.exclude_subjects is not None:
         args.include_subjects = [subject.split('-')[1] for subject in participants_info['participant_id'] if subject.split('-')[1] not in args.exclude_subjects]
+
+    if args.include_tasks is None and args.exclude_tasks is None:
+        args.include_tasks = range(4)    
+    if args.exclude_tasks is not None:
+        args.include_tasks = [task for task in range(4) if str(task) not in args.exclude_tasks]
+
+    print(f"Include subjects: {args.include_subjects}")
+    print(f"Include tasks: {args.include_tasks}")
 
     if args.print:
         utils.print_processing_info(config)
@@ -420,8 +430,7 @@ if __name__ == '__main__':
         subject = subject.split('-')[1]
         n_sessions = participants_info.loc[participants_info['participant_id'] == 'sub-' + subject, 'n_sessions'].iloc[0]
         for session in range(n_sessions):
-
-            for task in range(4):
+            for task in args.include_tasks:
                 if args.preICA: trial_ICA(subject, str(session), str(task), redo=args.redo)
                 if args.annotateICA: annotate_ICA(subject, str(session), str(task), redo=args.redo)
                 if args.postICA: 
