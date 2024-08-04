@@ -6,7 +6,7 @@ import mne
 from mne.io import read_raw_kit, read_raw, write_info, read_info
 import ast
 import time
-from autoreject import AutoReject, get_rejection_threshold
+from autoreject import AutoReject, get_rejection_threshold, read_reject_log
 from mne.coreg import Coregistration, scale_mri
 from wordfreq import zipf_frequency
 import itertools
@@ -90,13 +90,13 @@ def preprocess(subject, session, task, preICA):
     else:
         ar = AutoReject(n_jobs=8, random_state=config.getint('autoreject', 'random_state'))
         epochs = ar.fit_transform(epochs)
+
         report.add_epochs(epochs, title='Epochs after AutoReject')
-
-        bad_epochs = ar.get_reject_log(epochs).bad_epochs
-        bad_epochs.savetxt(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_bad_epochs.txt"))
-
         prec_path = os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostAR_epo.fif")
         epochs.save(prec_path, overwrite=True)
+
+        rej_log = ar.get_reject_log(epochs)
+        rej_log.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_reject_log.npz"))
 
     report.save(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-{'PreICA' if preICA else 'PostICA'}_report.html"), overwrite=True, open_browser=False)
     
@@ -201,36 +201,46 @@ def trial_coregister(subject, session, task):
         info = mne.io.read_info(info_path)
     
     # Coregistration
-    coreg = Coregistration(info, 'fsaverage', subjects_dir=config['directories']['freesurfer_subjects_dir'], fiducials="estimated")
-    coreg.set_scale_mode('uniform').set_fid_match('matched')
-    coreg.fit_fiducials()
-    coreg.set_scale_mode('3-axis')
-    for _ in range(4): 
-        coreg.fit_icp(nasion_weight=1)
-    trans_path = os.path.join(derivative_dir, f"sub-{subject}_ses-{session}_task-{task}_trans.fif")
-    mne.write_trans(trans_path, coreg.trans, overwrite=True)
-    new_mri_name = f"MEG-MASC_sub-{subject}_ses-{session}_task-{task}"
-    scale_mri('fsaverage', new_mri_name, subjects_dir=config['directories']['freesurfer_subjects_dir'], scale=coreg.scale, overwrite=True, annot=True)
-
+    if not os.path.exists(os.path.join(config['directories']['freesurfer_subjects_dir'], f"MEG-MASC_sub-{subject}")):
+        print(f"Creating MRI for subject {subject}")
+        coreg = Coregistration(info, 'fsaverage', subjects_dir=config['directories']['freesurfer_subjects_dir'], fiducials="estimated")
+        coreg.set_scale_mode('uniform').set_fid_match('matched')
+        coreg.fit_fiducials()
+        coreg.set_scale_mode('3-axis')
+        for _ in range(4): 
+            coreg.fit_icp(nasion_weight=1)
+        trans_path = os.path.join(derivative_dir, f"sub-{subject}_ses-{session}_task-{task}_trans.fif")
+        mne.write_trans(trans_path, coreg.trans, overwrite=True)
+        new_mri_name = f"MEG-MASC_sub-{subject}"
+        scale_mri('fsaverage', new_mri_name, subjects_dir=config['directories']['freesurfer_subjects_dir'], scale=coreg.scale, overwrite=True, annot=True)
+    else:
+        print(f"MRI for subject {subject} already exists")
+        coreg = Coregistration(info, f'MEG-MASC_sub-{subject}', subjects_dir=config['directories']['freesurfer_subjects_dir'], fiducials="estimated")
+        coreg.fit_fiducials()
+        for _ in range(4): 
+            coreg.fit_icp(nasion_weight=1)
+        trans_path = os.path.join(derivative_dir, f"sub-{subject}_ses-{session}_task-{task}_trans.fif")
+        mne.write_trans(trans_path, coreg.trans, overwrite=True)
+        
     report.add_trans(
         trans=trans_path,
         info=info,
-        subject=new_mri_name,
+        subject=f"MEG-MASC_sub-{subject}",
         subjects_dir=config['directories']['freesurfer_subjects_dir'],
         alpha=0.7,
         title="Coregistration"
     )
 
     # Source space
-    src = mne.setup_source_space(f"MEG-MASC_sub-{subject}_ses-{session}_task-{task}", spacing="oct6", add_dist="patch", subjects_dir=config['directories']['freesurfer_subjects_dir'])
+    src = mne.setup_source_space(f"MEG-MASC_sub-{subject}", spacing="oct6", add_dist="patch", subjects_dir=config['directories']['freesurfer_subjects_dir'])
     mne.write_source_spaces(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}-task-{task}_src.fif"), src, overwrite=True)
     # BEM
-    bem_model = mne.make_bem_model(subject=f"MEG-MASC_sub-{subject}_ses-{session}_task-{task}", 
+    bem_model = mne.make_bem_model(subject=f"MEG-MASC_sub-{subject}", 
                                    ico=4, conductivity=(0.3,), subjects_dir=config['directories']['freesurfer_subjects_dir'])
     bem = mne.make_bem_solution(bem_model)
     mne.write_bem_solution(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_bem.fif"), bem, overwrite=True)
 
-    report.add_bem(subject=f"MEG-MASC_sub-{subject}_ses-{session}_task-{task}", subjects_dir=config['directories']['freesurfer_subjects_dir'], title="BEM")
+    report.add_bem(subject=f"MEG-MASC_sub-{subject}", subjects_dir=config['directories']['freesurfer_subjects_dir'], title="BEM")
 
     report.save(os.path.join(derivative_dir, f"sub-{subject}_ses-{session}_task-{task}_coreg_report.html"), overwrite=True, open_browser=False)
 
@@ -354,9 +364,11 @@ def trial_rERF_source(subject, session, task, surp_win = [1, 300]):
     epochs = mne.read_epochs(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_desc-PostAR_epo.fif"))
     meta = utils.read_annotations(subject, str(session), str(task), config)
     meta = meta.query('kind=="word"')
+    meta = meta.reset_index(drop=True)
     # read bad epochs and remove them
-    bad_epochs = np.loadtxt(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_bad_epochs.txt"))
-    meta = meta.drop(bad_epochs.astype(int))
+    bad_epochs = read_reject_log(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-{session}", "meg", f"sub-{subject}_ses-{session}_task-{task}_reject_log.npz")).bad_epochs
+    keep_epochs = np.logical_not(bad_epochs)
+    meta = meta.loc[keep_epochs]
 
     intercept = np.ones((len(meta), 1))
     zipf_freq = np.array([zipf_frequency(word, 'en') for word in meta['word']])
