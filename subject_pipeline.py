@@ -31,6 +31,11 @@ def trial_get_raw(subject, session, task):
     raw = read_raw_kit(os.path.join(subject_data_dir, f"sub-{subject}_ses-{session}_task-{task}_meg.con"),
                        mrk = os.path.join(subject_data_dir, f"sub-{subject}_ses-{session}_task-{task}_markers.mrk"),
                        elp = elp / 1000, hsp = hsp / 1000).load_data()
+    
+    # Head shape point acquisition of session 1 is in general worse than that of session 0. 
+    if session != 0:
+        info_0 = mne.io.read_info(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-0", "meg", f"sub-{subject}_ses-0_task-{task}_info.fif"))
+        raw.info['dig'][8:] = info_0['dig'][8:]
 
     # Bad channel handling
     bad_channels_file = config['preprocessing']['bad_channels_file']
@@ -199,6 +204,11 @@ def trial_coregister(subject, session, task):
     else:
         print(f"Loading info file for subject {subject}, session {session} task {task}")
         info = mne.io.read_info(info_path)
+
+    # Head shape point acquisition of session 1 is in general worse than that of session 0. 
+    if session != 0:
+        info_0 = mne.io.read_info(os.path.join(config['directories']['derivative_dir'], f"sub-{subject}", f"ses-0", "meg", f"sub-{subject}_ses-0_task-{task}_info.fif"))
+        info['dig'][8:] = info_0['dig'][8:]
     
     # Coregistration
     if not os.path.exists(os.path.join(config['directories']['freesurfer_subjects_dir'], f"MEG-MASC_sub-{subject}")):
